@@ -5,6 +5,7 @@ import warnings
 
 class MAR:
     def __init__(self,
+                 dataset,
                  target_vars,
                  deter_vars,
                  model,
@@ -15,9 +16,11 @@ class MAR:
 
         Parameters
         ----------
-        target_vars: np.ndarray or pd.Series
-            Variable to introduce missingness into.
-        deter_vars: list[int]
+        dataset: pd.Dataframe
+            complete dataset which determines the shape of final output.
+        target_vars: pd.Series or pd.DataFrame
+            Variable to introduce missingness into. (e.g., df['X1] or df['X1','X2])
+        deter_vars: pd.Series or pd.DataFrame
             Determining features that are fully observed columns driving missingness
         model: callable
             Function to compute P(missing at target_vars | deter_vars) = f(deter_vars)
@@ -32,8 +35,8 @@ class MAR:
             raise ValueError(f"missing_rate must be in [0,1], got {missing_rate}")
         
         # Convert to numpy arrays and validate shapes
-        self.target_vars = self._validate_and_convert(target_vars, "target_vars")
-        self.deter_vars = self._validate_and_convert(deter_vars, "deter_vars")
+        self.target_vars, self.target_names = self._validate_and_convert(target_vars, "target_vars")
+        self.deter_vars, self.deter_names = self._validate_and_convert(deter_vars, "deter_vars")
 
         # Ensure same number of samples
         if len(self.target_vars) != len(self.deter_vars):
@@ -41,7 +44,8 @@ class MAR:
                 f"target_vars and deter_vars must have same number of samples."
                 f"Got {len(self.target_vars)} and {len(self.deter_vars)}"
             )
-
+        
+        self.dataset = dataset.copy()
         self.model = model
         self.missing_rate = missing_rate
         self.seed = seed
@@ -54,12 +58,22 @@ class MAR:
 
     def _validate_and_convert(self, data, name):
         '''Convert input to numpy array and validate.'''
+
+        names = []
+
         if isinstance(data, pd.Series):
+            names = [data.name if data.name is not None else 'col_0']
             data = data.values
         elif isinstance(data, pd.DataFrame):
+            names = data.colums.tolist()
             data = data.values
         elif isinstance(data, np.ndarray):
-            pass
+            # If it's a raw array, we generate generic names
+            values = data
+            if values.ndim == 1:
+                names = ['col_0']
+            else:
+                names = [f"col_{i}" for i in range(values.shape[1])]
         else:
             raise TypeError(
                 f"{name} must be numpy array, pandas Series, or Dataframe"
@@ -70,17 +84,22 @@ class MAR:
         elif data.ndim > 2:
             raise ValueError(f"{name} must be 1D or 2D, got {data.ndim}D")
         
-        return data
+        return data, names
     
 
-    def generate_mask(self):
+    def generate_mask(self, return_prob=False):
         '''
-        Generate missingness probability for each observation in target_vars.
+        Generate mask and missingness probability for each observation in target_vars.
+        
+        return_prob: bool, default=False
+            If True, also return the missing probabilities 
         
         Returns
         -------
-        missing_prob_adjusted: np.ndarray
-            Probability of missingness for each sample, shape(n_samples,)
+        self.mask: np.array
+            Boolean mask indicating missing positions (True = missing)
+        self.missing_prob_adjusted: np.ndarray
+            Probability of missingness for each sample adjusted by missing rate, shape(n_samples,) (only if return_prob=True)
         '''
         # Handle case where deter_vars has zero variance
         deter_vars_std = self.deter_vars.std(axis=0)
@@ -130,51 +149,32 @@ class MAR:
                 f"Achievable rate is {achievable_rate:.3f}."
                 f"Consider using a different model function."
             )
+        
+        # Convert missing probabilities into boolean mask (True = missing)
+        self.mask = np.random.binomial(1, self.missing_prob_adjusted, size=self.n_samples).astype(bool)
 
-        return self.missing_prob_adjusted
+        if return_prob:
+            return self.mask, self.missing_prob_adjusted
+        else:
+            return self.mask
 
-    def apply(self, return_mask=False):
+    def apply(self):
         '''
-        Apply missingness to target variables.
-
-        Parameters
-        ----------
-        return_mask: bool, default=False
-            If True, also return the boolean mask (True = missing)
-
+        Apply missingness to target variables and output dataset under MAR assumption.
+        
         Returns
         -------
         X_missing: np.ndarray
             Target variables with missing values (NaN), same shapes as target_vars
-        mask: np.array, optional
-            Boolean mask indicating missing positions (only if return_mask=True)
+        
         '''
         # Generate probabilities
-        missing_prob = self.generate_mask()
+        mask = self.generate_mask(return_prob=False)
 
-        # Convert probabilities to binary mask
-        # mask=True means missing
-        mask = np.random.binomial(1, missing_prob, size=self.n_samples).astype(bool)
+        # Apply mask to target_vars in the dataset
+        self.dataset.loc[mask, self.target_names] = np.nan
 
-        # Apply mask to target_vars
-        X_missing = self.target_vars.astype(float).copy()
-
-        # Handle multi-column target_vars
-        if X_missing.shape[1] == 1:
-            # Single target variable
-            X_missing[mask, 0] = np.nan
-        else:
-            # Multiple target variables - apply same mask to all
-            X_missing[mask, :] = np.nan
-
-        # Squeeze if single column
-        if X_missing.shape[1] == 1:
-            X_missing = X_missing.ravel()
-        
-        if return_mask:
-            return X_missing, mask
-        else:
-            return X_missing
+        return self.dataset
         
     def get_statistics(self):
         '''
@@ -259,6 +259,7 @@ if __name__ == "__main__":
     
     # Create MAR instance
     mar_income = MAR(
+        dataset=df,
         target_vars=df['income'],
         deter_vars=df['age'],
         model=model_age,
@@ -267,7 +268,8 @@ if __name__ == "__main__":
     )
     
     # Apply missingness
-    income_missing, mask = mar_income.apply(return_mask=True)
+    df_missing = mar_income.apply()
+    mask_income, missing_prob_income = mar_income.generate_mask(return_prob=True)
     
     # Get statistics
     stats = mar_income.get_statistics()
@@ -275,163 +277,9 @@ if __name__ == "__main__":
     for key, value in stats.items():
         print(f"  {key}: {value}")
     
-    # Add to dataframe
-    df['income_mar'] = income_missing
-    
     print(f"\nDataset with MAR missingness (first 15 rows):")
-    print(df.head(15))
+    print(df_missing.head(15))
     
-    print(f"\nActual missing rate: {df['income_mar'].isna().mean():.3f}")
-    print(f"Mean age (income observed): {df[df['income_mar'].notna()]['age'].mean():.2f}")
-    print(f"Mean age (income missing): {df[df['income_mar'].isna()]['age'].mean():.2f}")
-    
-    # ========================================
-    # Example 2: Multiple determining variables
-    # ========================================
-    print("\n" + "="*70)
-    print("EXAMPLE 2: Multiple Determining Variables (Age + Education → Income)")
-    print("="*70)
-    
-    # Add education variable
-    education = np.random.choice([1, 2, 3, 4], size=n, p=[0.3, 0.4, 0.2, 0.1])
-    df['education'] = education
-    
-    # Regenerate income based on both age and education
-    df['income'] = 20000 + 10000 * education + 500 * age + np.random.normal(0, 10000, n)
-    
-    # Model with multiple predictors
-    def model_multi(X_norm):
-        """
-        P(Income missing | Age, Education)
-        Lower age AND lower education → higher missing probability
-        
-        Parameters
-        ----------
-        X_norm : np.ndarray, shape (n_samples, 2)
-            Standardized [age, education]
-        """
-        return expit(-0.3 - 0.6 * X_norm[:, 0] - 0.4 * X_norm[:, 1])
-    
-    # Stack age and education
-    deter_multi = np.column_stack([age, education])
-    
-    mar_multi = MAR(
-        target_vars=df['income'],
-        deter_vars=deter_multi,
-        model=model_multi,
-        missing_rate=0.25,
-        seed=42
-    )
-    
-    income_missing_multi = mar_multi.apply()
-    df['income_mar_multi'] = income_missing_multi
-    
-    stats_multi = mar_multi.get_statistics()
-    print("\nMulti-variable MAR Statistics:")
-    for key, value in stats_multi.items():
-        print(f"  {key}: {value}")
-    
-    print(f"\nMissing rate by education level:")
-    for edu_level in [1, 2, 3, 4]:
-        mask_edu = df['education'] == edu_level
-        miss_rate = df.loc[mask_edu, 'income_mar_multi'].isna().mean()
-        mean_age = df.loc[mask_edu, 'age'].mean()
-        print(f"  Education {edu_level} (mean age={mean_age:.1f}): {miss_rate:.1%} missing")
-    
-    # ========================================
-    # Example 3: Using train_test_split pattern
-    # ========================================
-    print("\n" + "="*70)
-    print("EXAMPLE 3: Split-Apply-Combine Pattern with train_test_split")
-    print("="*70)
-    
-    from sklearn.model_selection import train_test_split
-    
-    # Create fresh dataset
-    df_complete = pd.DataFrame({
-        'age': np.random.randint(18, 80, n),
-        'income': np.random.normal(50000, 20000, n)
-    })
-    
-    print("Original complete dataset:")
-    print(df_complete.head(10))
-    
-    # Split into two groups
-    group1, group2 = train_test_split(df_complete, test_size=0.5, random_state=42)
-    
-    print(f"\nGroup 1 size: {len(group1)}")
-    print(f"Group 2 size: {len(group2)}")
-    
-    # Define models
-    def model_income_age(age_std):
-        return expit(0 + 1 * age_std.ravel())
-    
-    def model_age_income(income_std):
-        return expit(0 - 1 * income_std.ravel())
-    
-    # Group 1: Mask income based on age
-    mar1 = MAR(
-        target_vars=group1['income'],
-        deter_vars=group1['age'],
-        model=model_income_age,
-        missing_rate=0.30,
-        seed=42
-    )
-    group1['income'] = mar1.apply()
-    
-    # Group 2: Mask age based on income
-    mar2 = MAR(
-        target_vars=group2['age'].astype(float),  # Convert to float
-        deter_vars=group2['income'],
-        model=model_age_income,
-        missing_rate=0.30,
-        seed=42
-    )
-    group2['age'] = mar2.apply()
-    
-    # Combine back and sort by index
-    df_mar = pd.concat([group1, group2], axis=0).sort_index()
-    
-    print("\nCombined dataset with MAR missingness:")
-    print(df_mar.head(15))
-    
-    print(f"\nMissing pattern:")
-    both_obs = (~df_mar['age'].isna() & ~df_mar['income'].isna()).sum()
-    age_miss = (df_mar['age'].isna() & ~df_mar['income'].isna()).sum()
-    income_miss = (~df_mar['age'].isna() & df_mar['income'].isna()).sum()
-    both_miss = (df_mar['age'].isna() & df_mar['income'].isna()).sum()
-    
-    print(f"  Both observed: {both_obs} ({both_obs/len(df_mar):.1%})")
-    print(f"  Only age missing: {age_miss} ({age_miss/len(df_mar):.1%})")
-    print(f"  Only income missing: {income_miss} ({income_miss/len(df_mar):.1%})")
-    print(f"  Both missing: {both_miss} ({both_miss/len(df_mar):.1%})")
-    
-    # ========================================
-    # Example 4: Multiple target variables
-    # ========================================
-    print("\n" + "="*70)
-    print("EXAMPLE 4: Multiple Target Variables (same mask for all)")
-    print("="*70)
-    
-    # Create dataset with multiple targets
-    savings = 5000 + 0.1 * df['income'] + np.random.normal(0, 3000, n)
-    targets_multi = np.column_stack([df['income'].values, savings])
-    
-    mar_multi_target = MAR(
-        target_vars=targets_multi,
-        deter_vars=df['age'],
-        model=model_age,
-        missing_rate=0.20,
-        seed=42
-    )
-    
-    targets_missing = mar_multi_target.apply()
-    
-    print(f"Shape of output: {targets_missing.shape}")
-    print(f"Income missing rate: {np.isnan(targets_missing[:, 0]).mean():.3f}")
-    print(f"Savings missing rate: {np.isnan(targets_missing[:, 1]).mean():.3f}")
-    print("\nNote: Same mask is applied to both target variables")
-    
-    print("\n" + "="*70)
-    print("Examples completed successfully!")
-    print("="*70)
+    print(f"\nActual missing rate: {df_missing['income'].isna().sum()/(df_missing.shape[0] * df_missing.shape[1])}")
+    print(f"Mean age (income observed): {df_missing['age'][~mask_income].mean():.2f}")
+    print(f"Mean age (income missing): {df_missing['age'][mask_income].mean():.2f}")
